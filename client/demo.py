@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
-iptables Demo Client
-====================
-Demonstrates TCP flag filtering, IP blocking, and NAT using Scapy.
-
-Each test sends a crafted packet to the server and checks whether a
-response arrives (packet passed the firewall) or times out (packet
-was dropped by an iptables PREROUTING rule).
+iptables + ipset + fail2ban Demo Client
+========================================
+Demonstrates TCP flag filtering, IP blocking, NAT, ipset bulk blocking,
+and fail2ban auto-banning using Scapy, requests, and paramiko.
 
 Usage:
   python3 demo.py            # run all tests automatically
@@ -30,6 +27,7 @@ from scapy.all import IP, TCP, conf, sr1
 SERVER_IP   = os.environ.get("SERVER_IP",   "172.20.0.10")
 CLIENT_IP   = os.environ.get("CLIENT_IP",   "172.20.0.20")
 SERVER_PORT = int(os.environ.get("SERVER_PORT", "80"))
+SSH_PORT    = int(os.environ.get("SSH_PORT",    "22"))
 TIMEOUT     = float(os.environ.get("SCAPY_TIMEOUT", "2"))
 
 # Suppress Scapy's noisy output
@@ -199,9 +197,18 @@ def print_reference() -> None:
     for term, desc in nat_types:
         print(f"    {C}{term:<22}{RS}  {desc}")
 
+    print(f"\n{BD}  ipset + fail2ban{RS}")
+    ipset_info = [
+        ("ssh-blocklist",    "hash:ip  ", "fail2ban thêm IP quét SSH; tự động hết hạn theo bantime"),
+        ("proxy-blocklist",  "hash:net ", "fetch-proxies.sh tải danh sách proxy/exit-node công khai"),
+        ("manual-blocklist", "hash:ip  ", "Chặn tay ad-hoc — thêm/xóa bằng `ipset add/del`"),
+    ]
+    for name, type_, desc in ipset_info:
+        print(f"    {C}{name:<20}{RS}  {DM}{type_}{RS}  {desc}")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Individual tests
+#  Individual tests (1–15 — original iptables tests)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_normal_http() -> bool:
@@ -409,8 +416,6 @@ def explain_nat() -> None:
 
     info("Đang xác minh: đọc bảng NAT từ bên trong container client...")
     try:
-        # We can ask the server to print its NAT rules via docker exec in the guide,
-        # but here we can show the client's own NAT table for comparison.
         result = subprocess.run(
             ["iptables", "-t", "nat", "-L", "POSTROUTING", "-n", "-v"],
             capture_output=True, text=True,
@@ -426,6 +431,232 @@ def explain_nat() -> None:
     print(f"  {C}iptables -t nat -A PREROUTING -p tcp --dport 8888 -j DNAT --to-destination 172.20.0.10:80{RS}")
     print(f"  {DM}  → Kết nối đến cổng 8888 được chuyển tiếp đến cổng 80 của server.{RS}")
     print(f"  {DM}    Hữu ích cho reverse proxy và tường lửa chuyển tiếp cổng.{RS}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Test 16: ipset — client-side bulk IP block using ipset + iptables
+# ─────────────────────────────────────────────────────────────────────────────
+def test_ipset_client_block() -> bool:
+    banner("DEMO IPSET  (chặn bulk IP phía client bằng ipset)")
+    info("ipset cho phép quản lý danh sách IP lớn hiệu quả hơn nhiều quy tắc iptables riêng lẻ.")
+    info(f"Tạo ipset 'demo-block', thêm {SERVER_IP}, thêm OUTPUT rule tham chiếu set.")
+    print()
+
+    SETNAME = "demo-block"
+
+    def _ipset(*args) -> subprocess.CompletedProcess:
+        return subprocess.run(["ipset"] + list(args), capture_output=True)
+
+    def _ipt(*args) -> subprocess.CompletedProcess:
+        return subprocess.run(["iptables"] + list(args), capture_output=True)
+
+    # Cleanup helper
+    def cleanup():
+        _ipt("-D", "OUTPUT", "-m", "set", "--match-set", SETNAME, "dst", "-j", "DROP")
+        _ipset("destroy", SETNAME)
+
+    cleanup()  # ensure fresh state
+
+    # ── Step 1: baseline ──────────────────────────────────────
+    try:
+        r = requests.get(f"http://{SERVER_IP}:{SERVER_PORT}/", timeout=5)
+        result_pass(f"[Trước khi tạo ipset] HTTP {r.status_code} — kết nối OK")
+    except Exception as exc:
+        result_unexpected("LỖI CƠ SỞ", str(exc))
+        return False
+
+    # ── Step 2: create ipset, add server IP, add OUTPUT rule ──
+    info(f"ipset create {SETNAME} hash:ip")
+    _ipset("create", SETNAME, "hash:ip", "-exist")
+
+    info(f"ipset add {SETNAME} {SERVER_IP}")
+    _ipset("add", SETNAME, SERVER_IP, "-exist")
+
+    info(f"iptables -A OUTPUT -m set --match-set {SETNAME} dst -j DROP")
+    _ipt("-A", "OUTPUT", "-m", "set", "--match-set", SETNAME, "dst", "-j", "DROP")
+    time.sleep(0.3)
+
+    try:
+        r = requests.get(f"http://{SERVER_IP}:{SERVER_PORT}/", timeout=3)
+        result_unexpected("KHÔNG BỊ CHẶN", f"HTTP {r.status_code} — ipset rule không kích hoạt?")
+        cleanup()
+        return False
+    except Exception:
+        result_block(f"[Sau khi thêm vào ipset] Kết nối tới {SERVER_IP} bị chặn bởi ipset OUTPUT rule!")
+
+    # ── Step 3: destroy ipset and rule ────────────────────────
+    info(f"Xóa ipset và iptables rule")
+    cleanup()
+    time.sleep(0.3)
+
+    try:
+        r = requests.get(f"http://{SERVER_IP}:{SERVER_PORT}/", timeout=5)
+        result_pass(f"[Sau khi xóa ipset] HTTP {r.status_code} — lưu lượng được khôi phục!")
+        return True
+    except Exception as exc:
+        result_unexpected("VẪN BỊ CHẶN", str(exc))
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Test 17: fail2ban SSH ban — simulate brute force, verify ipset entry
+# ─────────────────────────────────────────────────────────────────────────────
+def test_fail2ban_ssh_ban() -> bool:
+    banner("DEMO FAIL2BAN  (SSH brute-force → ipset ssh-blocklist → xác minh)")
+    info("Client thực hiện nhiều lần đăng nhập SSH thất bại liên tiếp.")
+    info("fail2ban phát hiện và thêm IP client vào ssh-blocklist ipset.")
+    info(f"Cấu hình: maxretry=3, findtime=30s, bantime=120s")
+    print()
+
+    try:
+        import paramiko
+    except ImportError:
+        result_unexpected("THIẾU THƯ VIỆN", "paramiko chưa được cài đặt — pip install paramiko")
+        return False
+
+    MY_IP = CLIENT_IP
+
+    # ── Step 1: verify not currently banned ───────────────────
+    info("Kiểm tra trạng thái ban hiện tại...")
+    try:
+        r = requests.get(f"http://{SERVER_IP}:{SERVER_PORT}/ipset/ssh-blocklist", timeout=5)
+        data = r.json()
+        if MY_IP in data.get("members", []):
+            info(f"{MY_IP} đang bị ban từ trước — đang thử xóa...")
+            # Try to check if we can still reach HTTP; if fail2ban only blocks SSH, we still can
+    except Exception as exc:
+        info(f"Không thể truy vấn ipset endpoint: {exc}")
+
+    # ── Step 2: make 4 failed SSH authentication attempts ─────
+    ATTEMPTS = 4
+    info(f"Thực hiện {ATTEMPTS} lần đăng nhập SSH thất bại tới {SERVER_IP}:{SSH_PORT}...")
+    for i in range(1, ATTEMPTS + 1):
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            ssh.connect(
+                SERVER_IP,
+                port=SSH_PORT,
+                username=f"attacker{i}",
+                password="wrongpassword123",
+                timeout=5,
+                banner_timeout=8,
+                auth_timeout=5,
+                look_for_keys=False,
+                allow_agent=False,
+            )
+            ssh.close()
+        except paramiko.AuthenticationException:
+            info(f"  Lần {i}/{ATTEMPTS}: Xác thực thất bại (dự kiến) ✓")
+        except Exception as exc:
+            info(f"  Lần {i}/{ATTEMPTS}: Lỗi kết nối — {exc}")
+        time.sleep(0.5)
+
+    # ── Step 3: wait for fail2ban to process the log ──────────
+    WAIT = 12
+    info(f"Chờ {WAIT}s để fail2ban xử lý log và thêm IP vào ipset...")
+    for remaining in range(WAIT, 0, -3):
+        time.sleep(3)
+        sys.stdout.write(f"  {remaining}s còn lại...\r")
+        sys.stdout.flush()
+    print()
+
+    # ── Step 4: query the server's ipset via HTTP ─────────────
+    info(f"Truy vấn server: GET /ipset/ssh-blocklist")
+    try:
+        r = requests.get(f"http://{SERVER_IP}:{SERVER_PORT}/ipset/ssh-blocklist", timeout=5)
+        data = r.json()
+    except Exception as exc:
+        result_unexpected("KHÔNG THỂ TRUY VẤN", f"Không thể truy vấn /ipset/ssh-blocklist: {exc}")
+        return False
+
+    members = data.get("members", [])
+    count = data.get("count", 0)
+    info(f"ssh-blocklist hiện có {count} mục: {members[:5]}{'...' if count > 5 else ''}")
+
+    if MY_IP in members:
+        result_block(
+            f"[fail2ban đã ban] {MY_IP} có trong ssh-blocklist!\n"
+            f"  {DM}→ fail2ban phát hiện brute-force SSH và thêm IP vào ipset tự động.{RS}"
+        )
+        banned = True
+    else:
+        result_unexpected(
+            "CHƯA BỊ BAN",
+            f"{MY_IP} chưa xuất hiện trong ssh-blocklist — fail2ban có thể chưa xử lý log.\n"
+            f"  {DM}Kiểm tra: docker exec iptables_server fail2ban-client status sshd{RS}",
+        )
+        banned = False
+
+    # ── Step 5: verify SSH is now blocked ─────────────────────
+    if banned:
+        info("Xác minh SSH bị chặn bởi iptables + ipset rule...")
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(SERVER_IP, port=SSH_PORT, username="root", password="DemoPass123!",
+                        timeout=4, banner_timeout=5, auth_timeout=4,
+                        look_for_keys=False, allow_agent=False)
+            ssh.close()
+            result_unexpected("KẾT NỐI THÀNH CÔNG", "Mong đợi SSH bị chặn bởi ipset nhưng vẫn kết nối được")
+        except paramiko.AuthenticationException:
+            result_unexpected("AUTH LỖI", "Kết nối đến SSH nhưng bị từ chối auth — ipset rule có thể chưa kích hoạt")
+        except Exception:
+            result_block("[Xác nhận] SSH bị DROP bởi iptables ipset rule — kết nối timeout/refused!")
+
+    return banned
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Test 18: proxy-blocklist — verify fetch-proxies.sh populated the ipset
+# ─────────────────────────────────────────────────────────────────────────────
+def test_proxy_blocklist() -> bool:
+    banner("DEMO PROXY BLOCKLIST  (fetch-proxies.sh → proxy-blocklist ipset)")
+    info("Server chạy fetch-proxies.sh khi khởi động để tải danh sách proxy công khai.")
+    info("Test xác minh proxy-blocklist ipset đã được điền dữ liệu.")
+    print()
+
+    # ── Step 1: query the proxy-blocklist ─────────────────────
+    info(f"Truy vấn server: GET /ipset/proxy-blocklist")
+    try:
+        r = requests.get(f"http://{SERVER_IP}:{SERVER_PORT}/ipset/proxy-blocklist", timeout=5)
+        data = r.json()
+    except Exception as exc:
+        result_unexpected("KHÔNG THỂ TRUY VẤN", str(exc))
+        return False
+
+    if "error" in data:
+        result_unexpected("IPSET LỖI", data["error"])
+        return False
+
+    members  = data.get("members", [])
+    count    = data.get("count", 0)
+    header   = data.get("header", {})
+
+    info(f"Loại set:      {header.get('type', '?')}")
+    info(f"Số phần tử:    {count}")
+    info(f"Tối đa:        {header.get('maxelem', '?')}")
+    info(f"Mẫu (5 đầu):  {members[:5]}")
+
+    if count > 0:
+        result_pass(
+            f"proxy-blocklist có {BD}{count}{RS} mục — fetch-proxies.sh đã tải dữ liệu thành công!\n"
+            f"  {DM}→ Mọi traffic từ những IP/CIDR này sẽ bị DROP bởi iptables ipset rule.{RS}"
+        )
+        # ── Step 2: explain the iptables rule ─────────────────
+        print()
+        info("Quy tắc iptables sử dụng ipset:")
+        print(f"  {C}iptables -A INPUT -m set --match-set proxy-blocklist src -j DROP{RS}")
+        print(f"  {DM}  → Một quy tắc duy nhất chặn hàng nghìn IP/CIDR hiệu quả.{RS}")
+        print(f"  {DM}    ipset dùng hash table O(1) thay vì duyệt tuyến tính qua danh sách quy tắc.{RS}")
+        return True
+    else:
+        result_unexpected(
+            "IPSET TRỐNG",
+            "proxy-blocklist không có mục — fetch-proxies.sh có thể đã gặp lỗi mạng.\n"
+            f"  {DM}Kiểm tra: docker exec iptables_server /fetch-proxies.sh --verbose{RS}",
+        )
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -447,6 +678,10 @@ TESTS = [
     ("invalid_conntrack",    test_invalid_conntrack),
     ("fragmented",           test_fragmented),
     ("ip_blocking",          test_ip_blocking),
+    # ── ipset + fail2ban tests ───────────────────────────────
+    ("ipset_client_block",   test_ipset_client_block),
+    ("fail2ban_ssh_ban",     test_fail2ban_ssh_ban),
+    ("proxy_blocklist",      test_proxy_blocklist),
 ]
 
 
@@ -459,11 +694,12 @@ def main() -> None:
     if "--list" in args:
         print("Các bài kiểm tra có sẵn:")
         for i, (name, _) in enumerate(TESTS, 1):
-            print(f"  {i:>2}. {name}")
+            marker = "  [ipset/fail2ban]" if i >= 16 else ""
+            print(f"  {i:>2}. {name}{marker}")
         return
 
     banner(
-        "iptables Demo — Lọc Cờ TCP · Chặn IP · NAT"
+        "iptables + ipset + fail2ban Demo — Lọc Cờ TCP · Chặn IP · NAT · ipset · fail2ban"
         f"\n  Server: {BD}{SERVER_IP}:{SERVER_PORT}{RS}{B}   "
         f"Client: {BD}{CLIENT_IP}{RS}"
     )

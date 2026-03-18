@@ -17,12 +17,13 @@ services:
     networks:
       demo_net:
         ipv4_address: 172.25.0.10
-    privileged: true          # Required for iptables manipulation
+    privileged: true          # Required for iptables/ipset manipulation
     environment:
       - SERVER_IP=172.25.0.10
       - CLIENT_IP=172.25.0.20
     ports:
-      - "8080:80"             # Expose server HTTP to host for manual testing
+      - "8080:80"             # HTTP — manual testing from host
+      - "2222:22"             # SSH  — manual testing / fail2ban demo from host
     tty: true
     stdin_open: true
 
@@ -34,12 +35,13 @@ services:
     networks:
       demo_net:
         ipv4_address: 172.25.0.20
-    privileged: true          # Required for raw sockets (Scapy) and iptables (IP block demo)
+    privileged: true          # Required for raw sockets (Scapy), iptables, and ipset
     depends_on:
       - server
     environment:
       - SERVER_IP=172.25.0.10
       - CLIENT_IP=172.25.0.20
       - SERVER_PORT=80
+      - SSH_PORT=22
     tty: true
     stdin_open: true
